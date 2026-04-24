@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "contracts/governance",
+    "contracts/staking-bonuses",
     "lib",
     "shared",
 ]
