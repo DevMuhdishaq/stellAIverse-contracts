@@ -1,7 +1,11 @@
 [workspace]
 members = [
+    "contracts/bug-bounty",
+    "contracts/affiliate-bonuses",
+    "contracts/credit-scoring-waitlist",
     "contracts/governance",
     "contracts/staking-bonuses",
+    "contracts/multisig-waitlist",
     "lib",
     "shared",
 ]
