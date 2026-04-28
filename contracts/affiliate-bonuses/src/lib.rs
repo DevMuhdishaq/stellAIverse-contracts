@@ -224,7 +224,8 @@ impl AffiliateBonuses {
             .ok_or(ContractError::InvalidAgentId)?;
 
         let commission_key = (Symbol::new(&env, "commission"), affiliate.clone());
-        let mut pending_commissions: i128 = env.storage().instance().get(&commission_key).unwrap_or(0);
+        let mut pending_commissions: i128 =
+            env.storage().instance().get(&commission_key).unwrap_or(0);
 
         let user_commission_key = (Symbol::new(&env, "user_commission"), affiliate.clone());
         let mut user_total_commission: i128 = env
@@ -234,7 +235,8 @@ impl AffiliateBonuses {
             .unwrap_or(0);
 
         let affiliate_key = (Symbol::new(&env, "affiliate"), affiliate.clone());
-        let mut affiliate_info: AffiliateInfo = env.storage().instance().get(&affiliate_key).unwrap();
+        let mut affiliate_info: AffiliateInfo =
+            env.storage().instance().get(&affiliate_key).unwrap();
 
         let now = env.ledger().timestamp();
 
@@ -264,24 +266,33 @@ impl AffiliateBonuses {
             referral_record.first_transaction_at = Some(now);
         }
         referral_record.total_volume += volume;
-        env.storage().instance().set(&referral_key, &referral_record);
+        env.storage()
+            .instance()
+            .set(&referral_key, &referral_record);
 
         // Calculate and record commission if threshold met
         let commission_amount = (volume * config.commission_rate_bps as i128) / 10000;
 
-        if commission_amount > 0 && referral_record.total_volume >= config.min_volume_for_commission {
+        if commission_amount > 0 && referral_record.total_volume >= config.min_volume_for_commission
+        {
             if user_total_commission + commission_amount <= config.max_commission_per_user {
                 pending_commissions += commission_amount;
                 user_total_commission += commission_amount;
 
-                env.storage().instance().set(&commission_key, &pending_commissions);
-                env.storage().instance().set(&user_commission_key, &user_total_commission);
+                env.storage()
+                    .instance()
+                    .set(&commission_key, &pending_commissions);
+                env.storage()
+                    .instance()
+                    .set(&user_commission_key, &user_total_commission);
 
                 // Update affiliate stats
                 affiliate_info.total_volume_generated += volume;
                 affiliate_info.total_commissions_earned += commission_amount;
                 affiliate_info.last_activity_at = now;
-                env.storage().instance().set(&affiliate_key, &affiliate_info);
+                env.storage()
+                    .instance()
+                    .set(&affiliate_key, &affiliate_info);
 
                 env.events().publish(
                     (Symbol::new(&env, "commission"), Symbol::new(&env, "earned")),

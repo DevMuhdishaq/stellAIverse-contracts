@@ -60,7 +60,7 @@ impl ThresholdAgentContract {
             .get(&(agent_id, proposal_id))
             .unwrap();
         signer.require_auth();
-        
+
         let mut already_signed = false;
         for i in 0..proposal.signatures.len() {
             if proposal.signatures.get(i).unwrap() == signer {

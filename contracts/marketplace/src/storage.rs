@@ -555,8 +555,6 @@ pub fn get_fee_transition_state(env: &Env) -> Option<FeeTransitionState> {
     env.storage().instance().get(&DataKey::FeeTransitionState)
 }
 
-
-
 /* ---------------- LEASE CONFIGURATION ---------------- */
 
 #[derive(Clone)]

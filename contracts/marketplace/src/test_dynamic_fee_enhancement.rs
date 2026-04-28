@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{contract, contractimpl, testutils, Address, BytesN, Env, Symbol, Vec};
     use crate::Marketplace;
+    use soroban_sdk::{contract, contractimpl, testutils, Address, BytesN, Env, Symbol, Vec};
 
     #[test]
     fn test_dynamic_fee_adjustment_enhancement() {
@@ -63,7 +63,6 @@ mod tests {
             75, // fallback value
         );
         assert_eq!(congestion_value, 75); // Should use fallback in test
-
     }
 
     #[test]
@@ -90,7 +89,6 @@ mod tests {
 
         let volatility_high = Marketplace::calculate_volatility_factor(70);
         assert_eq!(volatility_high, 1180); // 0.9x + (70 * 4) = 1180
-
     }
 
     #[test]
@@ -121,7 +119,6 @@ mod tests {
 
         let updated_state = storage::get_fee_transition_state(&env).unwrap();
         assert_eq!(updated_state.current_step, 6);
-
     }
 
     #[test]
@@ -139,7 +136,6 @@ mod tests {
         let stale_value =
             Marketplace::get_oracle_value_by_key(&env, &oracle_id, "platform_utilization", 25);
         assert_eq!(stale_value, 25);
-
     }
 
     #[test]
@@ -168,6 +164,5 @@ mod tests {
         assert_eq!(retrieved.adjustment_id, 1);
         assert_eq!(retrieved.old_fee_bps, 250);
         assert_eq!(retrieved.new_fee_bps, 300);
-
     }
 }

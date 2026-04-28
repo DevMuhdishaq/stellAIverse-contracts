@@ -9,13 +9,14 @@ mod storage;
 #[cfg(test)]
 mod test_dynamic_fee_enhancement;
 
-
 use soroban_sdk::{
-    contract, contractimpl, token, Address, Bytes, BytesN, Env, IntoVal, Map, String, Symbol, TryIntoVal, Val, Vec,
+    contract, contractimpl, token, Address, Bytes, BytesN, Env, IntoVal, Map, String, Symbol,
+    TryIntoVal, Val, Vec,
 };
 use stellai_lib::{
     atomic::AtomicTransactionSupport,
     audit::{create_audit_log, OperationType},
+    errors::{error_description, ContractError},
     rbac,
     storage_keys::LISTING_COUNTER_KEY,
     types::{
@@ -24,7 +25,6 @@ use stellai_lib::{
         ListingType, RoyaltyInfo,
     },
     validation,
-    errors::{ContractError, error_description},
 };
 
 use atomic::MarketplaceAtomicSupport;
@@ -216,17 +216,24 @@ impl Marketplace {
 
         env.events().publish(
             (Symbol::new(&env, "agent_sold"),),
-            (listing_id, listing.agent_id, buyer.clone(), platform_fee_bps),
+            (
+                listing_id,
+                listing.agent_id,
+                buyer.clone(),
+                platform_fee_bps,
+            ),
         );
 
         // Auto-mint credit score NFT for successful purchase
-        if let Err(e) =
-            Self::auto_mint_credit_on_purchase(env.clone(), listing_id, buyer.clone())
-        {
+        if let Err(e) = Self::auto_mint_credit_on_purchase(env.clone(), listing_id, buyer.clone()) {
             // Log error but don't fail the transaction
             env.events().publish(
                 (Symbol::new(&env, "CreditScoreNFTMintFailed"),),
-                (listing_id, buyer, String::from_str(&env, error_description(e))),
+                (
+                    listing_id,
+                    buyer,
+                    String::from_str(&env, error_description(e)),
+                ),
             );
         }
     }
@@ -791,19 +798,26 @@ impl Marketplace {
 
                 env.events().publish(
                     (Symbol::new(&env, "AuctionWon"),),
-                    (auction_id, winner.clone(), auction.highest_bid, platform_fee_bps),
+                    (
+                        auction_id,
+                        winner.clone(),
+                        auction.highest_bid,
+                        platform_fee_bps,
+                    ),
                 );
 
                 // Auto-mint credit score NFT for auction win
-                if let Err(e) = Self::auto_mint_credit_on_auction(
-                    env.clone(),
-                    auction_id,
-                    winner.clone(),
-                ) {
+                if let Err(e) =
+                    Self::auto_mint_credit_on_auction(env.clone(), auction_id, winner.clone())
+                {
                     // Log error but don't fail the transaction
                     env.events().publish(
                         (Symbol::new(&env, "CreditScoreNFTMintFailed"),),
-                        (auction_id, winner, String::from_str(&env, error_description(e))),
+                        (
+                            auction_id,
+                            winner,
+                            String::from_str(&env, error_description(e)),
+                        ),
                     );
                 }
             } else {
@@ -1818,29 +1832,29 @@ impl Marketplace {
             // Oracle returned void, use fallback
             fallback
         } else {
-                // Try to parse the result as OracleData
-                // In a real implementation, this would be more robust
-                // For now, we'll simulate oracle data validation
-                let current_time = env.ledger().timestamp();
+            // Try to parse the result as OracleData
+            // In a real implementation, this would be more robust
+            // For now, we'll simulate oracle data validation
+            let current_time = env.ledger().timestamp();
 
-                // Simulate getting recent oracle data
-                // In production, this would parse the actual oracle response
-                let simulated_value = fallback; // Use fallback as simulated value
-                let simulated_timestamp = current_time - 60; // 1 minute ago
+            // Simulate getting recent oracle data
+            // In production, this would parse the actual oracle response
+            let simulated_value = fallback; // Use fallback as simulated value
+            let simulated_timestamp = current_time - 60; // 1 minute ago
 
-                // Validate oracle data is within expected range
-                if simulated_value >= 0 && simulated_value <= 100 {
-                    // Check if data is recent (within last 5 minutes)
-                    if current_time - simulated_timestamp <= 300 {
-                        simulated_value
-                    } else {
-                        // Oracle data is stale, use fallback
-                        fallback
-                    }
+            // Validate oracle data is within expected range
+            if simulated_value >= 0 && simulated_value <= 100 {
+                // Check if data is recent (within last 5 minutes)
+                if current_time - simulated_timestamp <= 300 {
+                    simulated_value
                 } else {
-                    // Oracle data out of range, use fallback
+                    // Oracle data is stale, use fallback
                     fallback
                 }
+            } else {
+                // Oracle data out of range, use fallback
+                fallback
+            }
         }
     }
 
@@ -2498,8 +2512,6 @@ impl Marketplace {
         );
     }
 
-
-
     // ---------------- CREDIT SCORE NFT INTEGRATION ----------------
 
     /// Set credit score NFT contract address (admin only)
@@ -2536,8 +2548,8 @@ impl Marketplace {
     ) -> Result<u64, ContractError> {
         user.require_auth();
 
-        let nft_contract =
-            Self::get_credit_score_nft_contract(env.clone()).ok_or(ContractError::NotInitialized)?;
+        let nft_contract = Self::get_credit_score_nft_contract(env.clone())
+            .ok_or(ContractError::NotInitialized)?;
 
         // Validate credit score range
         if credit_score < 300 || credit_score > 850 {
@@ -2551,9 +2563,15 @@ impl Marketplace {
         let mint_request = {
             let mut request_map = Map::<Symbol, Val>::new(&env);
             request_map.set(Symbol::new(&env, "owner"), user.clone().into_val(&env));
-            request_map.set(Symbol::new(&env, "credit_score"), credit_score.into_val(&env));
+            request_map.set(
+                Symbol::new(&env, "credit_score"),
+                credit_score.into_val(&env),
+            );
             request_map.set(Symbol::new(&env, "score_type"), score_type.into_val(&env));
-            request_map.set(Symbol::new(&env, "expires_at"), expiration_time.into_val(&env));
+            request_map.set(
+                Symbol::new(&env, "expires_at"),
+                expiration_time.into_val(&env),
+            );
 
             // Create metadata as Map
             let mut metadata_map = Map::<Symbol, Val>::new(&env);
@@ -2563,9 +2581,13 @@ impl Marketplace {
             );
             metadata_map.set(
                 Symbol::new(&env, "description"),
-                String::from_str(&env, "Credit score NFT earned through marketplace activity").into_val(&env),
+                String::from_str(&env, "Credit score NFT earned through marketplace activity")
+                    .into_val(&env),
             );
-            metadata_map.set(Symbol::new(&env, "image"), metadata_cid.clone().into_val(&env));
+            metadata_map.set(
+                Symbol::new(&env, "image"),
+                metadata_cid.clone().into_val(&env),
+            );
             metadata_map.set(
                 Symbol::new(&env, "external_url"),
                 String::from_str(&env, "https://stellAIverse.io").into_val(&env),
@@ -2573,21 +2595,36 @@ impl Marketplace {
 
             // Create attributes as Vec
             let mut attributes = Vec::<Val>::new(&env);
-            
+
             let mut attr1 = Map::<Symbol, Val>::new(&env);
-            attr1.set(Symbol::new(&env, "trait_type"), String::from_str(&env, "transaction_type").into_val(&env));
-            attr1.set(Symbol::new(&env, "value"), transaction_type.clone().into_val(&env));
+            attr1.set(
+                Symbol::new(&env, "trait_type"),
+                String::from_str(&env, "transaction_type").into_val(&env),
+            );
+            attr1.set(
+                Symbol::new(&env, "value"),
+                transaction_type.clone().into_val(&env),
+            );
             attributes.push_back(attr1.into_val(&env));
 
             let mut attr2 = Map::<Symbol, Val>::new(&env);
-            attr2.set(Symbol::new(&env, "trait_type"), String::from_str(&env, "transaction_value").into_val(&env));
+            attr2.set(
+                Symbol::new(&env, "trait_type"),
+                String::from_str(&env, "transaction_value").into_val(&env),
+            );
             attr2.set(Symbol::new(&env, "value"), transaction_value.into_val(&env));
             attributes.push_back(attr2.into_val(&env));
 
             let mut attr3 = Map::<Symbol, Val>::new(&env);
-            attr3.set(Symbol::new(&env, "trait_type"), String::from_str(&env, "credit_score").into_val(&env));
+            attr3.set(
+                Symbol::new(&env, "trait_type"),
+                String::from_str(&env, "credit_score").into_val(&env),
+            );
             attr3.set(Symbol::new(&env, "value"), credit_score.into_val(&env));
-            attr3.set(Symbol::new(&env, "display_type"), String::from_str(&env, "number").into_val(&env));
+            attr3.set(
+                Symbol::new(&env, "display_type"),
+                String::from_str(&env, "number").into_val(&env),
+            );
             attributes.push_back(attr3.into_val(&env));
 
             metadata_map.set(Symbol::new(&env, "attributes"), attributes.into_val(&env));
@@ -2595,12 +2632,30 @@ impl Marketplace {
 
             // Create verification data as Map
             let mut verification_map = Map::<Symbol, Val>::new(&env);
-            verification_map.set(Symbol::new(&env, "verification_method"), String::from_str(&env, "marketplace_activity").into_val(&env));
-            verification_map.set(Symbol::new(&env, "verified_by"), env.current_contract_address().into_val(&env));
-            verification_map.set(Symbol::new(&env, "verification_timestamp"), env.ledger().timestamp().into_val(&env));
-            verification_map.set(Symbol::new(&env, "verification_hash"), BytesN::from_array(&env, &[0u8; 32]).into_val(&env));
-            verification_map.set(Symbol::new(&env, "external_reference"), String::from_str(&env, "tx_ref").into_val(&env));
-            request_map.set(Symbol::new(&env, "verification_data"), verification_map.into_val(&env));
+            verification_map.set(
+                Symbol::new(&env, "verification_method"),
+                String::from_str(&env, "marketplace_activity").into_val(&env),
+            );
+            verification_map.set(
+                Symbol::new(&env, "verified_by"),
+                env.current_contract_address().into_val(&env),
+            );
+            verification_map.set(
+                Symbol::new(&env, "verification_timestamp"),
+                env.ledger().timestamp().into_val(&env),
+            );
+            verification_map.set(
+                Symbol::new(&env, "verification_hash"),
+                BytesN::from_array(&env, &[0u8; 32]).into_val(&env),
+            );
+            verification_map.set(
+                Symbol::new(&env, "external_reference"),
+                String::from_str(&env, "tx_ref").into_val(&env),
+            );
+            request_map.set(
+                Symbol::new(&env, "verification_data"),
+                verification_map.into_val(&env),
+            );
 
             request_map
         };
@@ -2614,10 +2669,7 @@ impl Marketplace {
 
         // Log the minting
         let before_state = String::from_str(&env, "{}");
-        let after_state = String::from_str(
-            &env,
-            "Credit score NFT minted",
-        );
+        let after_state = String::from_str(&env, "Credit score NFT minted");
         let tx_hash = String::from_str(&env, "0x_credit_score_minted");
         let description = Some(String::from_str(
             &env,
@@ -2661,8 +2713,8 @@ impl Marketplace {
         let credit_score = base_score + value_bonus;
 
         // Check if user already has too many NFTs (prevent spam)
-        let nft_contract =
-            Self::get_credit_score_nft_contract(env.clone()).ok_or(ContractError::NotInitialized)?;
+        let nft_contract = Self::get_credit_score_nft_contract(env.clone())
+            .ok_or(ContractError::NotInitialized)?;
 
         let existing_nfts: Vec<u64> = env.invoke_contract(
             &nft_contract,
@@ -2735,8 +2787,8 @@ impl Marketplace {
 
     /// Get user's credit score NFTs
     pub fn get_user_credit_score_nfts(env: Env, user: Address) -> Result<Vec<u64>, ContractError> {
-        let nft_contract =
-            Self::get_credit_score_nft_contract(env.clone()).ok_or(ContractError::NotInitialized)?;
+        let nft_contract = Self::get_credit_score_nft_contract(env.clone())
+            .ok_or(ContractError::NotInitialized)?;
 
         let nfts: Vec<u64> = env.invoke_contract(
             &nft_contract,
@@ -2749,8 +2801,8 @@ impl Marketplace {
 
     /// Get user's aggregated credit score from NFTs
     pub fn get_user_aggregated_credit_score(env: Env, user: Address) -> Result<u32, ContractError> {
-        let nft_contract =
-            Self::get_credit_score_nft_contract(env.clone()).ok_or(ContractError::NotInitialized)?;
+        let nft_contract = Self::get_credit_score_nft_contract(env.clone())
+            .ok_or(ContractError::NotInitialized)?;
 
         let nfts = Self::get_user_credit_score_nfts(env.clone(), user.clone())?;
 
@@ -2800,8 +2852,8 @@ impl Marketplace {
         verifier: Address,
         user: Address,
     ) -> Result<(), ContractError> {
-        let nft_contract =
-            Self::get_credit_score_nft_contract(env.clone()).ok_or(ContractError::NotInitialized)?;
+        let nft_contract = Self::get_credit_score_nft_contract(env.clone())
+            .ok_or(ContractError::NotInitialized)?;
 
         let nfts = Self::get_user_credit_score_nfts(env.clone(), user.clone())?;
 
@@ -2824,11 +2876,14 @@ impl Marketplace {
                 env.invoke_contract::<Val>(
                     &nft_contract,
                     &Symbol::new(&env, "verify_credit_score"),
-                    Vec::from_array(&env, [
-                        verifier.clone().into_val(&env),
-                        token_id.into_val(&env),
-                        verification_hash.into_val(&env),
-                    ]),
+                    Vec::from_array(
+                        &env,
+                        [
+                            verifier.clone().into_val(&env),
+                            token_id.into_val(&env),
+                            verification_hash.into_val(&env),
+                        ],
+                    ),
                 );
             }
         }

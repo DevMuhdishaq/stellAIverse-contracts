@@ -472,7 +472,7 @@ impl Governance {
         let snapshot_exists = get_delegation_snapshot(&env, proposal_id).is_some();
         let mechanism = get_voting_mechanism(&env);
         let voting_power = Self::calculate_total_voting_power(&env, &voter);
-        
+
         // ─── VALIDATION PHASE ───
         if current_time < proposal.voting_starts {
             panic!("Voting has not started yet");
@@ -491,13 +491,14 @@ impl Governance {
         }
 
         // ─── MUTATION PHASE ───
-        
+
         // Create delegation snapshot for secure voting if not exists
         if !snapshot_exists {
             Self::create_delegation_snapshot(&env, proposal_id);
         }
 
-        let (vote_weight, voting_power_used) = Self::calculate_vote_weight_internal(mechanism, voting_power);
+        let (vote_weight, voting_power_used) =
+            Self::calculate_vote_weight_internal(mechanism, voting_power);
 
         // Record vote
         let vote = Vote {
@@ -531,7 +532,10 @@ impl Governance {
     }
 
     /// Calculate vote weight based on voting mechanism (linear or quadratic)
-    fn calculate_vote_weight_internal(mechanism: VotingMechanism, voting_power: u128) -> (u128, u128) {
+    fn calculate_vote_weight_internal(
+        mechanism: VotingMechanism,
+        voting_power: u128,
+    ) -> (u128, u128) {
         match mechanism {
             VotingMechanism::Linear => {
                 // Linear voting: 1 token = 1 vote
@@ -1539,7 +1543,7 @@ impl Governance {
         }
 
         // ─── MUTATION PHASE ───
-        
+
         // Persist the execution state before calling out to the target contract
         proposal.status = ProposalStatus::Executed;
         set_proposal(env, &proposal);
