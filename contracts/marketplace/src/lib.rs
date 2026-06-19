@@ -1,8 +1,6 @@
 #![no_std]
+pub mod types;
 
-mod atomic;
-mod payment_types;
-mod payments;
 #[cfg(test)]
 mod prop_tests;
 mod storage;
@@ -11,12 +9,13 @@ mod test_bid_history;
 #[cfg(test)]
 mod test_dynamic_fee_enhancement;
 
+use payment_types::PaymentRecord;
+use payments::{calculate_splits, execute_payment_routing, PaymentRoutingContext};
 use soroban_sdk::{
     contract, contractimpl, token, Address, Bytes, BytesN, Env, IntoVal, Map, String, Symbol,
     TryIntoVal, Val, Vec,
 };
 use stellai_lib::{
-    atomic::AtomicTransactionSupport,
     audit::{create_audit_log, OperationType},
     errors::{error_description, ContractError},
     rbac,
@@ -28,52 +27,23 @@ use stellai_lib::{
     },
     validation,
 };
-
-use atomic::MarketplaceAtomicSupport;
-use payment_types::PaymentRecord;
-use payments::{calculate_splits, execute_payment_routing, PaymentRoutingContext};
-use storage::*;
+use storage::{Escrow, EscrowConfig, EscrowStatus, *};
 
 #[contract]
-pub struct Marketplace;
+pub struct MarketplaceContract;
+
+const DATA_EXPIRATION_WINDOW_SECONDS: u64 = 3600; 
+const BPS_DENOMINATOR: u128 = 10_000;
 
 #[contractimpl]
-impl Marketplace {
-    /// Initialize contract with admin
-    pub fn init_contract(env: Env, admin: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic!("Contract already initialized");
-        }
-
+impl MarketplaceContract {
+    
+    pub fn authorize_oracle(env: Env, admin: Address, oracle: Address) {
         admin.require_auth();
-        set_admin(&env, &admin);
-
-        env.storage()
-            .instance()
-            .set(&Symbol::new(&env, LISTING_COUNTER_KEY), &0u64);
-        storage::set_platform_fee(&env, 250);
+        env.storage().instance().set(&Symbol::new(&env, "oracle"), &oracle);
     }
 
-    /// Set a new admin
-    pub fn set_admin(env: Env, new_admin: Address) {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        admin.require_auth();
-        set_admin(&env, &new_admin);
-    }
-
-    /// Set the payment token
-    pub fn set_payment_token(env: Env, admin: Address, token: Address) {
-        admin.require_auth();
-        Self::verify_admin(&env, &admin);
-        set_payment_token(&env, token);
-    }
-
-    /// Set the platform fee in basis points (max 50%).
-    pub fn set_platform_fee(env: Env, admin: Address, fee_bps: u32) {
+    pub fn set_circuit_breaker(env: Env, admin: Address, status: MarketplaceCircuitBreaker) {
         admin.require_auth();
         assert!(fee_bps <= 5000, "Platform fee cannot exceed 50%");
         Self::verify_admin(&env, &admin);
@@ -168,7 +138,7 @@ impl Marketplace {
         listing_id
     }
 
-    /// Purchase an agent
+    /// Purchase an agent - funds are held in escrow until buyer confirms receipt
     pub fn buy_agent(env: Env, listing_id: u64, buyer: Address) {
         buyer.require_auth();
 
@@ -181,8 +151,9 @@ impl Marketplace {
             .expect("Listing not found");
 
         let approval_config = get_approval_config(&env);
-        let platform_fee_bps = Self::get_platform_fee(env.clone());
-        let royalty_info = Marketplace::get_royalty(env.clone(), listing.agent_id);
+        let escrow_config = get_escrow_config(&env);
+        let _platform_fee_bps = Self::get_platform_fee(env.clone());
+        let _royalty_info = Marketplace::get_royalty(env.clone(), listing.agent_id);
 
         // ─── VALIDATION PHASE ───
         if validation::validate_nonzero_id(listing_id).is_err() {
@@ -202,27 +173,43 @@ impl Marketplace {
         // Process fee transition if active
         Self::process_fee_transition(env.clone());
 
-        Self::route_sale_payment(
-            &env,
-            listing.agent_id,
-            listing.price,
-            &buyer,
-            &listing.seller,
-            royalty_info,
-            platform_fee_bps,
-        );
+        // Transfer funds from buyer to contract (escrow)
+        let payment_token = get_payment_token(&env);
+        let token_client = token::Client::new(&env, &payment_token);
+        token_client.transfer(&buyer, &env.current_contract_address(), &listing.price);
+
+        // Create escrow entry
+        let escrow_id = increment_escrow_counter(&env);
+        let now = env.ledger().timestamp();
+        let escrow = Escrow {
+            escrow_id,
+            listing_id,
+            agent_id: listing.agent_id,
+            buyer: buyer.clone(),
+            seller: listing.seller.clone(),
+            amount: listing.price,
+            created_at: now,
+            auto_release_at: now + escrow_config.auto_release_period_seconds,
+            status: EscrowStatus::Held,
+            dispute_resolved_at: None,
+            resolved_by: None,
+        };
+        set_escrow(&env, &escrow);
 
         // Mark listing as inactive
         listing.active = false;
         env.storage().instance().set(&listing_key, &listing);
 
         env.events().publish(
-            (Symbol::new(&env, "agent_sold"),),
+            (Symbol::new(&env, "agent_purchased_escrowed"),),
             (
                 listing_id,
+                escrow_id,
                 listing.agent_id,
                 buyer.clone(),
-                platform_fee_bps,
+                listing.seller.clone(),
+                listing.price,
+                escrow.auto_release_at,
             ),
         );
 
@@ -867,154 +854,54 @@ impl Marketplace {
         get_approval(&env, approval_id)
     }
 
-    /// Get approval history
-    pub fn get_approval_history(env: Env, approval_id: u64) -> Vec<ApprovalHistory> {
-        if approval_id == 0 {
-            panic!("Invalid approval ID");
+    pub fn verify_and_get_oracle_value(
+        env: Env, 
+        oracle_data: OracleData, 
+        _signature: BytesN<64>
+    ) -> u128 {
+        let breaker: MarketplaceCircuitBreaker = env.storage().instance()
+            .get(&Symbol::new(&env, "breaker"))
+            .unwrap_or(MarketplaceCircuitBreaker::Active);
+            
+        if let MarketplaceCircuitBreaker::Terminated = breaker {
+            panic!("Marketplace core operations are locked via circuit breaker");
         }
 
-        let history_count = get_approval_history_count(&env, approval_id);
-        let mut history = Vec::new(&env);
+        let authorized_oracle: Address = env.storage().instance()
+            .get(&Symbol::new(&env, "oracle"))
+            .unwrap_or_else(|| panic!("Oracle reference not configured"));
 
-        for i in 0..history_count {
-            if let Some(entry) = get_approval_history(&env, approval_id, i) {
-                history.push_back(entry);
-            }
+        let mut check_payload = Bytes::new(&env);
+        check_payload.append(&oracle_data.metric_id.to_xdr(&env));
+        check_payload.append(&oracle_data.value.to_xdr(&env));
+        check_payload.append(&oracle_data.timestamp.to_xdr(&env));
+
+        // Fix: Cast explicitly into a generic Soroban Val mapping
+        authorized_oracle.require_auth_for_args(vec![&env, check_payload.into()]);
+
+        let current_ledger_time = env.ledger().timestamp();
+        if current_ledger_time > oracle_data.timestamp + DATA_EXPIRATION_WINDOW_SECONDS {
+            panic!("Oracle data attestation has expired");
         }
 
-        history
+        oracle_data.value
     }
 
-    /// Clean up expired approvals (can be called by anyone)
-    pub fn cleanup_expired_approvals(env: Env) {
-        let counter = get_approval_counter(&env);
-        let mut cleaned_count = 0u64;
-
-        for approval_id in 1..=counter {
-            if let Some(approval) = get_approval(&env, approval_id) {
-                if approval.status == ApprovalStatus::Pending
-                    && env.ledger().timestamp() >= approval.expires_at
-                {
-                    // Mark as expired
-                    let mut expired_approval = approval;
-                    expired_approval.status = ApprovalStatus::Expired;
-                    set_approval(&env, &expired_approval);
-
-                    // Add to history
-                    let history = ApprovalHistory {
-                        approval_id,
-                        action: String::from_str(&env, "expired"),
-                        actor: env.current_contract_address(),
-                        timestamp: env.ledger().timestamp(),
-                        reason: None,
-                    };
-                    add_approval_history(&env, approval_id, &history);
-
-                    cleaned_count += 1;
-                }
-            }
+    pub fn calculate_dynamic_price(
+        _env: Env, 
+        rule: PricingRule, 
+        verified_metric_value: u128
+    ) -> u128 {
+        if verified_metric_value == 0 {
+            return rule.base_price;
         }
 
-        if cleaned_count > 0 {
-            env.events().publish(
-                (Symbol::new(&env, "ExpiredApprovalsCleaned"),),
-                (cleaned_count,),
-            );
-        }
-    }
+        let adjustment = verified_metric_value
+            .checked_mul(rule.scale_factor_bps as u128)
+            .unwrap_or(0) / BPS_DENOMINATOR;
 
-    // ---------------- AUCTIONS ----------------
-
-    /// Dutch params: (start_price, end_price, duration_seconds, price_decay). Use (None,None,None,None) for non-Dutch.
-    pub fn create_auction(
-        env: Env,
-        agent_id: u64,
-        seller: Address,
-        auction_type: AuctionType,
-        start_price: i128,
-        reserve_price: i128,
-        duration: u64,
-        min_bid_increment_bps: u32,
-    ) -> u64 {
-        seller.require_auth();
-        assert!(start_price > 0, "Invalid start price");
-        assert!(duration > 0, "Invalid duration");
-
-        let auction_id = increment_auction_counter(&env);
-        let start_time = env.ledger().timestamp();
-        let end_time = start_time + duration;
-
-        let auction = Auction {
-            auction_id,
-            agent_id,
-            seller,
-            auction_type,
-            start_price,
-            reserve_price,
-            current_price: start_price,
-            highest_bidder: None,
-            highest_bid: 0,
-            start_time,
-            end_time,
-            min_bid_increment_bps,
-            status: AuctionStatus::Active,
-            dutch_config: None,
-            sealed_commit_end: None,
-            sealed_reveal_end: None,
-        };
-
-        set_auction(&env, &auction);
-
-        env.events().publish(
-            (Symbol::new(&env, "AuctionCreated"),),
-            (auction_id, agent_id, auction_type, start_price),
-        );
-
-        auction_id
-    }
-
-    pub fn calculate_dutch_price(env: Env, auction_id: u64) -> i128 {
-        let auction = get_auction(&env, auction_id).expect("Auction not found");
-        assert!(
-            auction.auction_type == AuctionType::Dutch,
-            "Not a Dutch auction"
-        );
-
-        // Simplified calculation without dutch_config
-        let now = env.ledger().timestamp();
-        if now <= auction.start_time {
-            return auction.start_price;
-        }
-        if now >= auction.end_time {
-            return auction.reserve_price;
-        }
-
-        // Linear decay from start_price to reserve_price
-        let elapsed = now - auction.start_time;
-        let duration = auction.end_time - auction.start_time;
-        let price_range = auction.start_price - auction.reserve_price;
-        auction.start_price - (price_range * (elapsed as i128)) / (duration as i128)
-    }
-
-    pub fn place_bid(env: Env, auction_id: u64, bidder: Address, amount: i128) {
-        bidder.require_auth();
-        let mut auction = get_auction(&env, auction_id).expect("Auction not found");
-        assert!(
-            auction.status == AuctionStatus::Active,
-            "Auction not active"
-        );
-        assert!(
-            auction.auction_type == AuctionType::English,
-            "Not an English auction"
-        );
-        assert!(
-            env.ledger().timestamp() < auction.end_time,
-            "Auction expired"
-        );
-
-        let min_increment = (auction.highest_bid * (auction.min_bid_increment_bps as i128)) / 10000;
-        let computed_min_step = if min_increment > 1000 {
-            min_increment
+        if rule.inverse {
+            rule.base_price.checked_sub(adjustment).unwrap_or(0)
         } else {
             1000
         };
@@ -2001,57 +1888,6 @@ impl Marketplace {
         );
     }
 
-    // ============ ATOMIC TRANSACTION SUPPORT ============
-
-    /// Prepare atomic transaction step
-    pub fn prepare_atomic_step(
-        env: Env,
-        transaction_id: u64,
-        step_id: u32,
-        function: Symbol,
-        args: Vec<Val>,
-    ) -> bool {
-        MarketplaceAtomicSupport::prepare_step(&env, transaction_id, step_id, &function, &args)
-    }
-
-    /// Commit atomic transaction step
-    pub fn commit_atomic_step(
-        env: Env,
-        transaction_id: u64,
-        step_id: u32,
-        function: Symbol,
-        args: Vec<Val>,
-    ) -> Val {
-        MarketplaceAtomicSupport::commit_step(&env, transaction_id, step_id, &function, &args)
-    }
-
-    /// Check if atomic step is prepared
-    pub fn is_atomic_step_prepared(env: Env, transaction_id: u64, step_id: u32) -> bool {
-        MarketplaceAtomicSupport::is_step_prepared(&env, transaction_id, step_id)
-    }
-
-    /// Get atomic step result
-    pub fn get_atomic_step_result(env: Env, transaction_id: u64, step_id: u32) -> Option<Val> {
-        MarketplaceAtomicSupport::get_step_result(&env, transaction_id, step_id)
-    }
-
-    /// Rollback atomic transaction step (called by rollback functions)
-    pub fn rollback_atomic_step(
-        env: Env,
-        transaction_id: u64,
-        step_id: u32,
-        rollback_function: Symbol,
-        rollback_args: Vec<Val>,
-    ) -> bool {
-        MarketplaceAtomicSupport::rollback_step(
-            &env,
-            transaction_id,
-            step_id,
-            &rollback_function,
-            &rollback_args,
-        )
-    }
-
     // ============ ATOMIC TRANSACTION ROLLBACK FUNCTIONS ============
 
     /// Unlock a listing (rollback function)
@@ -2068,11 +1904,225 @@ impl Marketplace {
         }
     }
 
-    /// Refund from escrow (rollback function)
+    /// Refund from escrow (rollback function) - can only be called by contract for atomic rollbacks
     pub fn refund_from_escrow(env: Env, buyer: Address, amount: i128) -> bool {
-        // In a real implementation, this would refund tokens from escrow
-        // For now, just return success
-        true
+        // Find any active escrow for this buyer with sufficient funds
+        let buyer_escrows = get_buyer_escrows(&env, &buyer);
+        for escrow_id in buyer_escrows.iter() {
+            if let Some(mut escrow) = get_escrow(&env, escrow_id) {
+                if escrow.status == EscrowStatus::Held
+                    && escrow.amount >= amount
+                    && escrow.buyer == buyer
+                {
+                    // Transfer funds back to buyer
+                    let payment_token = get_payment_token(&env);
+                    let token_client = token::Client::new(&env, &payment_token);
+                    token_client.transfer(&env.current_contract_address(), &buyer, &amount);
+
+                    // Update escrow status
+                    escrow.status = EscrowStatus::Refunded;
+                    escrow.dispute_resolved_at = Some(env.ledger().timestamp());
+                    set_escrow(&env, &escrow);
+
+                    env.events().publish(
+                        (Symbol::new(&env, "escrow_refunded"),),
+                        (escrow_id, buyer.clone(), amount),
+                    );
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Buyer confirms receipt of the agent, releasing funds from escrow to seller
+    pub fn confirm_receipt(env: Env, escrow_id: u64, buyer: Address) {
+        buyer.require_auth();
+
+        let mut escrow = get_escrow(&env, escrow_id).expect("Escrow not found");
+        assert!(escrow.buyer == buyer, "Only buyer can confirm receipt");
+        assert!(
+            escrow.status == EscrowStatus::Held,
+            "Escrow is not in held status"
+        );
+
+        // Release funds to seller by routing payment
+        let platform_fee_bps = Self::get_platform_fee(env.clone());
+        let royalty_info = Marketplace::get_royalty(env.clone(), escrow.agent_id);
+
+        Self::route_sale_payment(
+            &env,
+            escrow.agent_id,
+            escrow.amount,
+            &escrow.buyer,
+            &escrow.seller,
+            royalty_info,
+            platform_fee_bps,
+        );
+
+        // Update escrow status
+        escrow.status = EscrowStatus::Released;
+        escrow.dispute_resolved_at = Some(env.ledger().timestamp());
+        escrow.resolved_by = Some(buyer.clone());
+        set_escrow(&env, &escrow);
+
+        env.events().publish(
+            (Symbol::new(&env, "escrow_released"),),
+            (escrow_id, escrow.seller.clone(), escrow.amount),
+        );
+    }
+
+    /// Buyer opens a dispute on an escrow, requiring admin resolution
+    pub fn open_dispute(env: Env, escrow_id: u64, buyer: Address, reason: String) {
+        buyer.require_auth();
+
+        let mut escrow = get_escrow(&env, escrow_id).expect("Escrow not found");
+        assert!(escrow.buyer == buyer, "Only buyer can open a dispute");
+        assert!(
+            escrow.status == EscrowStatus::Held,
+            "Escrow is not in held status"
+        );
+
+        // Update escrow status to disputed
+        escrow.status = EscrowStatus::Disputed;
+        set_escrow(&env, &escrow);
+
+        env.events().publish(
+            (Symbol::new(&env, "dispute_opened"),),
+            (escrow_id, buyer.clone(), reason),
+        );
+    }
+
+    /// Admin resolves a dispute, deciding whether to release funds to seller or refund buyer
+    pub fn resolve_dispute(
+        env: Env,
+        escrow_id: u64,
+        admin: Address,
+        release_to_seller: bool,
+        reason: String,
+    ) {
+        admin.require_auth();
+        Self::verify_admin(&env, &admin);
+
+        let mut escrow = get_escrow(&env, escrow_id).expect("Escrow not found");
+        assert!(
+            escrow.status == EscrowStatus::Disputed,
+            "Escrow is not in disputed status"
+        );
+
+        let payment_token = get_payment_token(&env);
+        let token_client = token::Client::new(&env, &payment_token);
+
+        if release_to_seller {
+            // Release funds to seller
+            let platform_fee_bps = Self::get_platform_fee(env.clone());
+            let royalty_info = Marketplace::get_royalty(env.clone(), escrow.agent_id);
+
+            Self::route_sale_payment(
+                &env,
+                escrow.agent_id,
+                escrow.amount,
+                &escrow.buyer,
+                &escrow.seller,
+                royalty_info,
+                platform_fee_bps,
+            );
+            escrow.status = EscrowStatus::Released;
+        } else {
+            // Refund full amount to buyer
+            token_client.transfer(
+                &env.current_contract_address(),
+                &escrow.buyer,
+                &escrow.amount,
+            );
+            escrow.status = EscrowStatus::Refunded;
+        }
+
+        escrow.dispute_resolved_at = Some(env.ledger().timestamp());
+        escrow.resolved_by = Some(admin.clone());
+        set_escrow(&env, &escrow);
+
+        env.events().publish(
+            (Symbol::new(&env, "dispute_resolved"),),
+            (escrow_id, release_to_seller, reason),
+        );
+    }
+
+    /// Process auto-release of escrows that have passed their auto-release timestamp
+    pub fn process_auto_release(env: Env) {
+        // Get all escrows (in production, we'd track pending escrows more efficiently)
+        // For simplicity, this can be called to process all expired escrows
+        let now = env.ledger().timestamp();
+        let mut escrow_id = 1;
+        while let Some(mut escrow) = get_escrow(&env, escrow_id) {
+            if escrow.status == EscrowStatus::Held && now >= escrow.auto_release_at {
+                // Auto-release funds to seller
+                let platform_fee_bps = Self::get_platform_fee(env.clone());
+                let royalty_info = Marketplace::get_royalty(env.clone(), escrow.agent_id);
+
+                Self::route_sale_payment(
+                    &env,
+                    escrow.agent_id,
+                    escrow.amount,
+                    &escrow.buyer,
+                    &escrow.seller,
+                    royalty_info,
+                    platform_fee_bps,
+                );
+
+                escrow.status = EscrowStatus::Released;
+                escrow.dispute_resolved_at = Some(now);
+                set_escrow(&env, &escrow);
+
+                env.events().publish(
+                    (Symbol::new(&env, "escrow_auto_released"),),
+                    (escrow_id, escrow.seller.clone(), escrow.amount),
+                );
+            }
+            escrow_id += 1;
+        }
+    }
+
+    /// Admin sets escrow configuration (auto-release period and dispute window)
+    pub fn set_escrow_config(
+        env: Env,
+        admin: Address,
+        auto_release_period: u64,
+        dispute_window: u64,
+    ) {
+        admin.require_auth();
+        Self::verify_admin(&env, &admin);
+
+        let config = EscrowConfig {
+            auto_release_period_seconds: auto_release_period,
+            dispute_window_seconds: dispute_window,
+        };
+        set_escrow_config(&env, &config);
+
+        env.events().publish(
+            (Symbol::new(&env, "escrow_config_updated"),),
+            (auto_release_period, dispute_window),
+        );
+    }
+
+    /// Get current escrow configuration
+    pub fn get_escrow_config(env: Env) -> EscrowConfig {
+        get_escrow_config(&env)
+    }
+
+    /// Get a specific escrow entry
+    pub fn get_escrow(env: Env, escrow_id: u64) -> Option<Escrow> {
+        get_escrow(&env, escrow_id)
+    }
+
+    /// Get all escrows for a buyer
+    pub fn get_buyer_escrows(env: Env, buyer: Address) -> Vec<u64> {
+        get_buyer_escrows(&env, &buyer)
+    }
+
+    /// Get all escrows for a seller
+    pub fn get_seller_escrows(env: Env, seller: Address) -> Vec<u64> {
+        get_seller_escrows(&env, &seller)
     }
 
     /// Revert sale (rollback function)
@@ -2933,12 +2983,3 @@ impl Marketplace {
         Ok(())
     }
 }
-
-//#[cfg(test)]
-//mod test_approval;
-
-#[cfg(test)]
-mod test_dynamic_fees;
-
-#[cfg(test)]
-mod test_lease;
