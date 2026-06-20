@@ -26,9 +26,8 @@ use stellai_lib::{
     storage_keys::LISTING_COUNTER_KEY,
     types::{
         Approval, ApprovalConfig, ApprovalHistory, ApprovalStatus, Auction, AuctionStatus,
-        AuctionType, AssetClass, AssetClassRoyaltySettings, BidRecord, LeaseData,
-        LeaseExtensionRequest, LeaseHistoryEntry, LeaseState, Listing, ListingType, RoyaltyConfig,
-        RoyaltyInfo, RoyaltyPaymentRecord, RoyaltyRecipient,
+        AuctionType, BidRecord, LeaseData, LeaseExtensionRequest, LeaseHistoryEntry, LeaseState,
+        Listing, ListingType, RoyaltyInfo, TransactionStep, TransactionStatus,
     },
     validation,
 };
@@ -76,6 +75,33 @@ impl MarketplaceContract {
     /// Get the configured platform fee.
     pub fn get_platform_fee(env: Env) -> u32 {
         storage::get_platform_fee(&env)
+    }
+
+    /// Atomic transaction support functions
+    pub fn get_next_atomic_transaction_id(env: Env) -> u64 {
+        crate::atomic::MarketplaceAtomicSupport::get_next_transaction_id(&env)
+    }
+
+    pub fn execute_atomic_transaction(env: Env, initiator: Address, steps: Vec<TransactionStep>) -> bool {
+        initiator.require_auth();
+        let transaction_id = Self::get_next_atomic_transaction_id(env.clone());
+        crate::atomic::MarketplaceAtomicSupport::execute_atomic_transaction(&env, transaction_id, &steps)
+    }
+
+    pub fn try_execute_atomic_transaction(env: Env, initiator: Address, steps: Vec<TransactionStep>) -> bool {
+        initiator.require_auth();
+        let transaction_id = Self::get_next_atomic_transaction_id(env.clone());
+        crate::atomic::MarketplaceAtomicSupport::execute_atomic_transaction(&env, transaction_id, &steps)
+    }
+
+    pub fn get_atomic_transaction(env: Env, transaction_id: u64) -> Option<crate::atomic::AtomicTransactionState> {
+        let tx_key = (Symbol::new(&env, "atomic_tx"), transaction_id);
+        env.storage().instance().get(&tx_key)
+    }
+
+    pub fn get_atomic_step_state(env: Env, transaction_id: u64, step_id: u32) -> Option<crate::atomic::AtomicStepState> {
+        let step_key = (Symbol::new(&env, "atomic_step"), transaction_id, step_id);
+        env.storage().instance().get(&step_key)
     }
 
     /// Internal: verify caller is the stored admin — always re-reads from storage (Issue #152)
