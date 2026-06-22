@@ -188,7 +188,8 @@ impl CreditScoringWaitlist {
             let position_key = (Symbol::new(&env, "position"), position);
             if let Some(user) = env.storage().instance().get::<_, Address>(&position_key) {
                 let user_key = (Symbol::new(&env, "user"), user.clone());
-                if let Some(mut entry) = env.storage().instance().get::<_, WaitlistEntry>(&user_key) {
+                if let Some(mut entry) = env.storage().instance().get::<_, WaitlistEntry>(&user_key)
+                {
                     if entry.status == WaitlistStatus::Pending {
                         // Update entry status
                         entry.status = WaitlistStatus::Notified;
